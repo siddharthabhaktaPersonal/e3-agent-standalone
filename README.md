@@ -17,11 +17,14 @@ has been removed and replaced with an L2 KPI protocol - see "History" below.
 
 | File | Contents |
 |---|---|
+| `e3_l2_kpi.h` | **Pure C header** - the L2 KPI struct layout (`E3CellL2Info`, `E3UeL2Stats`, ...) and the C API (`e3_agent_create`/`e3_agent_update_l2_slot`/`e3_agent_destroy`) a DU includes and links against. Zero C++ dependency. |
 | `e3_agent.hpp` / `e3_agent.cpp` | The E3 interface: ZMQ REQ/REP setup session, PUB/SUB subscribe/indications, `e3::StreamType` wire IDs for the L2 KPI set. No SHM. |
 | `nvlog.hpp` | ~60-line logging shim (level-filtered, prints to stderr) standing in for NVIDIA's internal logger. |
-| `data_lake.hpp` / `data_lake.cpp` | `DataLake`: a plain C++ struct holding one slot's worth of per-UE L2 KPIs, plus a synthetic slot-clock generator (`pushL2Slot`). |
-| `main.cpp` | Standalone process entry point: a slot clock that calls into `DataLake` every slot. |
+| `data_lake.hpp` / `data_lake.cpp` | `DataLake`: holds one slot's worth of per-UE L2 KPIs (using the same structs `e3_l2_kpi.h` defines), a push-model entry point (`updateL2Slot`) real data arrives through, and a synthetic slot-clock generator (`pushL2Slot`) for standalone testing. |
+| `e3_c_api.cpp` | Implements `e3_l2_kpi.h`'s C API by wrapping `DataLake` behind an opaque handle. |
+| `main.cpp` | Standalone process entry point: a slot clock that calls `DataLake::pushL2Slot` (synthetic data) every slot. |
 | `e3_manager.cpp` | Sample E3 Manager (dApp-side reference client) that decodes and prints every L2 KPI field. |
+| `examples/du_integration_example.c` | Sample DU-side integration, in plain C, showing the push model end-to-end via `e3_l2_kpi.h`. |
 
 ## L2 KPIs
 
@@ -42,8 +45,11 @@ Per UE, per slot:
 Plus topology/timing: `timestamp`, `timestamp_tai`, `sfn`, `slot`, `cell_id`,
 `n_cells`, `n_ue` (cell-level UE count), `rnti` (per-UE identity).
 
-`MAX_LCID` (32) and `MAX_DL_HARQ_ROUNDS` (4) are `constexpr` in `e3_agent.hpp`
-- change and rebuild if your use case needs different bounds.
+`E3_MAX_LCID` (32), `E3_MAX_DL_HARQ_ROUNDS` (4), `E3_MAX_UES_PER_CELL` (16),
+and `E3_MAX_CELLS` (8) are `#define`s in `e3_l2_kpi.h` - change and rebuild
+*everything* (agent, manager, and any DU) if your deployment needs different
+bounds; they determine `E3CellL2Info`'s memory layout, so the DU and the
+agent must agree on them.
 
 **Scoping note:** the MAC-side struct this was specified against
 (`per_ue_per_slot_e3_stats_t`) also carries `is_valid` and `ue_index` fields.
@@ -77,12 +83,69 @@ cmake ..
 make -j
 ```
 
-Produces two binaries: `e3_agent_standalone` and `e3_manager_sample`.
+Produces a static library (`libe3agent.a`, built from `e3_agent.cpp` +
+`data_lake.cpp` + `e3_c_api.cpp`) and three executables that link against
+it: `e3_agent_standalone`, `du_integration_example`, plus the standalone
+`e3_manager_sample` (which doesn't need `libe3agent` at all - it only ever
+speaks the wire protocol).
+
+## DU integration (push model, C API)
+
+A real DU pushes its own L2 KPIs instead of relying on the built-in random
+generator. `e3_l2_kpi.h` is a pure C header (no C++, no STL, no
+`std::vector` - fixed-size arrays only) declaring:
+
+- The KPI struct layout: `E3UeL2Stats` (nesting `PrbStats`, `TbsStats`,
+  `PerLcidBytes`, `McsIndexStats`, `WbCqi`, `TbStats`, `SnrStats`,
+  `BsrStats`, `PhrStats`) and `E3CellL2Info` (a fixed `E3UeL2Stats
+  ues[E3_MAX_UES_PER_CELL]` array plus a valid-count `n_ue`).
+- Three C functions: `e3_agent_create()`, `e3_agent_update_l2_slot()`,
+  `e3_agent_destroy()`.
+
+A DU's integration is: call `e3_agent_create()` once, then once per TTI
+build an `E3CellL2Info[]` from its own scheduler state and call
+`e3_agent_update_l2_slot(handle, sfn, slot, cells, n_cells)` - that's it, no
+ZMQ or JSON on the DU's side. See `examples/du_integration_example.c` for a
+complete, compiling (as plain C) example; it links against the same
+`libe3agent.a` `e3_agent_standalone` uses.
+
+```c
+#include "e3_l2_kpi.h"
+
+E3AgentHandle* h = e3_agent_create(5555, 5556, 5557);
+
+E3CellL2Info cells[E3_MAX_CELLS];
+/* ... fill cells[0].cell_id, cells[0].n_ue, cells[0].ues[i].* from your
+ * scheduler state ... */
+e3_agent_update_l2_slot(h, sfn, slot, cells, n_cells);   /* once per TTI */
+
+e3_agent_destroy(h);
+```
+
+`E3CellL2Info` is dominated by `PerLcidBytes` (2 × `E3_MAX_LCID` `uint64_t`
+= 512 bytes per UE regardless of how many LCIDs are actually active), so a
+full `E3CellL2Info[E3_MAX_CELLS]` array is tens of KB - prefer `static` or
+heap storage over a large on-stack array if your calling thread has a
+constrained stack (the example does this).
+
+`e3_agent_update_l2_slot()` only copies data into a mutex-guarded snapshot
+and returns immediately - it never blocks on a subscriber and never sends
+anything itself. `E3Agent`'s own notifier thread (see "Protocol summary"
+below) is what actually sends indications, on each subscription's own
+configured periodicity, independent of how often the DU calls this.
 
 ## Run
 
+Standalone (synthetic data, no DU):
+
 ```
 ./e3_agent_standalone --cells 2 --ues 3 --slot-us 500
+```
+
+Or with a real DU pushing data:
+
+```
+./du_integration_example 5555 5556 5557
 ```
 
 In another terminal:
@@ -147,10 +210,12 @@ independent of how often the underlying data actually changes.
 
 ## Not included
 
-This is a protocol/plumbing reference, not a scheduler simulator: KPI values
-are uniform random, not physically or scheduler-meaningful. Swap
-`DataLake::pushL2Slot` in `data_lake.cpp` for a real MAC stats source to get
-meaningful values without touching the E3 interface itself.
+`e3_agent_standalone`'s built-in generator (`DataLake::pushL2Slot`) produces
+uniform-random KPI values, not physically or scheduler-meaningful ones - it
+exists to exercise the protocol without a real DU attached. For real
+values, run a real DU against the C API described above (or point
+`du_integration_example.c` at your own scheduler state) instead of
+`e3_agent_standalone`.
 
 ## History
 

@@ -35,6 +35,7 @@
 #include <nlohmann/json.hpp>
 
 #include "nvlog.hpp"
+#include "e3_l2_kpi.h"
 
 #define TAG_E3 (NVLOG_TAG_BASE_CUPHY_CONTROLLER + 7) // "CTL.E3"
 
@@ -114,10 +115,12 @@ enum class StreamType : uint64_t {
 
 constexpr uint32_t STREAM_TYPE_COUNT = 30;
 
-/** Max logical channels reported in per_lcid_bytes_t arrays. */
-constexpr uint32_t MAX_LCID = 32;
-/** Max HARQ rounds reported in tb_stats_t::dl_harq_rounds. */
-constexpr uint32_t MAX_DL_HARQ_ROUNDS = 4;
+/** Max logical channels reported in per_lcid_bytes_t arrays. Single source
+ * of truth is E3_MAX_LCID in e3_l2_kpi.h (the DU-facing C header) - this is
+ * just a typed C++ alias for use in this file's fmt::format() calls. */
+constexpr uint32_t MAX_LCID = E3_MAX_LCID;
+/** Max HARQ rounds reported in tb_stats_t::dl_harq_rounds; see MAX_LCID note. */
+constexpr uint32_t MAX_DL_HARQ_ROUNDS = E3_MAX_DL_HARQ_ROUNDS;
 
 /** E3AP protocol version supported by this agent implementation */
 constexpr std::string_view E3AP_PROTOCOL_VERSION = "2.0.0";

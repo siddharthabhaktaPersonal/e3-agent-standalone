@@ -154,11 +154,13 @@ void E3Agent::sendDueIndications()
         return;
     }
 
-    E3L2BufferInfo buffer_info;
-    {
-        std::lock_guard<std::mutex> lock(dataLake->e3_buffer_mutex);
-        buffer_info = dataLake->e3_buffer_info;
-    }
+    // Read the snapshot in place rather than copying it: E3L2BufferInfo's
+    // fixed E3_MAX_CELLS * E3_MAX_UES_PER_CELL arrays make a by-value copy
+    // tens of KB, and this runs on every notifier tick regardless of
+    // whether anything is actually due. Holding the buffer lock across JSON
+    // building (below) is cheap in comparison - no I/O happens in between.
+    std::lock_guard<std::mutex> buffer_lock(dataLake->e3_buffer_mutex);
+    const E3L2BufferInfo& buffer_info = dataLake->e3_buffer_info;
 
     std::lock_guard<std::mutex> lock(e3_subscriptions_mutex);
     for (auto& [sub_id, sub] : e3_subscriptions) {
@@ -212,7 +214,8 @@ void E3Agent::sendDueIndications()
         // Per-cell array: cell-level scalars + nested ues[].
         const e3::StreamType ue_streams = sub.stream_bitfield & e3::PER_UE_STREAMS;
         json cells_arr = json::array();
-        for (const auto& cell : buffer_info.cells) {
+        for (uint16_t ci = 0; ci < buffer_info.n_cells; ++ci) {
+            const E3CellL2Info& cell = buffer_info.cells[ci];
             json cell_obj;
             uint64_t remaining = static_cast<uint64_t>(cell_streams);
             while (remaining != 0) {
@@ -230,9 +233,10 @@ void E3Agent::sendDueIndications()
                 remaining &= ~lowest_bit;
             }
 
-            if (static_cast<uint64_t>(ue_streams) != 0 && !cell.ues.empty()) {
+            if (static_cast<uint64_t>(ue_streams) != 0 && cell.n_ue > 0) {
                 json ues_arr = json::array();
-                for (const auto& ue : cell.ues) {
+                for (uint16_t ui = 0; ui < cell.n_ue; ++ui) {
+                    const E3UeL2Stats& ue = cell.ues[ui];
                     json ue_obj;
                     uint64_t ue_remaining = static_cast<uint64_t>(ue_streams);
                     while (ue_remaining != 0) {
