@@ -19,11 +19,17 @@ README's "History" section).
   silently breaks any real consumer. There is no automated wire-format test
   here - verify manually with `e3_manager_sample` against
   `e3_agent_standalone` after any change to this enum or to
-  `notifyDataReady()`'s field mapping.
+  `sendDueIndications()`'s field mapping.
 - Keep `data_lake.hpp`'s KPI structs (`PrbStats`, `TbsStats`, `PerLcidBytes`,
   `McsIndexStats`, `WbCqi`, `TbStats`, `SnrStats`, `BsrStats`, `PhrStats`)
-  and `e3_agent.cpp`'s `notifyDataReady()` field mapping in sync - each
+  and `e3_agent.cpp`'s `sendDueIndications()` field mapping in sync - each
   `e3::StreamType` bit corresponds to exactly one field/array here.
+- Data refresh and notification are on deliberately decoupled cadences:
+  `DataLake::pushL2Slot()` (driven by `main.cpp`'s slot clock) only updates
+  the current KPI snapshot; `E3Agent`'s own notifier thread independently
+  wakes on `NOTIFIER_TICK_INTERVAL` and sends indications to whichever
+  subscriptions are due per their own `periodicity_us`. Don't reintroduce a
+  direct call from `DataLake` into `E3Agent` to "push" a notification.
 
 ## What lives where
 

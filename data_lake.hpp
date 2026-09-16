@@ -7,8 +7,14 @@
  * / mcs_index_stats_t / wb_cqi_t / tb_stats_t / snr_stats_t / bsr_stats_t /
  * phr_stats_t), guarded by a mutex that E3Agent reads under as a friend.
  * There is no shared memory in this version - every field here is small
- * enough to travel in the indication's JSON protocolData, so pushL2Slot()
- * just swaps in a freshly built struct and calls notifyDataReady().
+ * enough to travel in the indication's JSON protocolData.
+ *
+ * DataLake only keeps this snapshot fresh (pushL2Slot() swaps in a newly
+ * synthesized struct); it does not decide when to notify anyone. E3Agent
+ * runs its own notifier thread that independently reads this snapshot and
+ * sends an indication to each subscription according to that subscription's
+ * own configured periodicity_us - the two cadences (data refresh vs.
+ * notification) are decoupled on purpose.
  */
 
 #ifndef DATA_LAKE_H
@@ -138,7 +144,10 @@ public:
     bool start();
     void stop();
 
-    // Synthesize and publish one slot of L2 KPIs, then fire notifyDataReady().
+    // Synthesize one slot of L2 KPIs and store it as the current snapshot.
+    // Does NOT trigger any notification - E3Agent's own notifier thread
+    // reads this snapshot independently and sends indications to each
+    // subscription on its own configured periodicity_us.
     void pushL2Slot(uint16_t sfn, uint16_t slot, const std::vector<SlotCellTopology>& cells);
 
     E3Agent* agent() { return e3_agent.get(); }

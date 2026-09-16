@@ -136,7 +136,14 @@ and open in Wireshark with the ZeroMQ/ZMTP dissector.
 There is no shared-memory channel in this version - every KPI travels inline
 in `indicationMessage.protocolData`. Full message shapes are in
 `e3_agent.cpp`'s `handleSetupRequest` / `handleSubscriptionRequest` /
-`notifyDataReady`.
+`sendDueIndications`.
+
+Data refresh and notification run on independent cadences: `DataLake`'s
+slot-clock-driven `pushL2Slot()` (in `main.cpp`) only updates the current KPI
+snapshot; `E3Agent` has its own internal notifier thread that wakes every
+`NOTIFIER_TICK_INTERVAL` (1 ms) and sends an indication to each subscription
+exactly when *that subscription's* configured `periodicity` has elapsed,
+independent of how often the underlying data actually changes.
 
 ## Not included
 

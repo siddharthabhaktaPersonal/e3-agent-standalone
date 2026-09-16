@@ -221,7 +221,7 @@ constexpr StreamType PER_UE_STREAMS =
 
 // All streams the (single) L2 indication path can provide. There is only
 // one data path now (no PUSCH/SRS split like the L1 version had), so
-// there's just one mask and notifyDataReady() fires for any non-empty
+// there's just one mask and sendDueIndications() fires for any non-empty
 // subscription, gated only by periodicity.
 constexpr StreamType ALL_PROVIDABLE_STREAMS =
     StreamType::TIMESTAMP | StreamType::TIMESTAMP_TAI | StreamType::SFN | StreamType::SLOT |
@@ -243,10 +243,15 @@ public:
     bool init();
     void shutdown();
 
-    void notifyDataReady();
-
 private:
     DataLake* dataLake;
+
+    // How often the notifier thread wakes to check subscriptions for due
+    // indications. This is a polling granularity, not a KPI refresh rate -
+    // DataLake updates its buffer on its own cadence (see main.cpp's slot
+    // clock); this just bounds how promptly a subscription's periodicity_us
+    // is honored. 1ms is comfortably finer than any sane periodicity.
+    static constexpr std::chrono::milliseconds NOTIFIER_TICK_INTERVAL{1};
 
     // E3 Agent configuration
     uint16_t e3RepPort;
@@ -264,9 +269,11 @@ private:
     std::thread e3_data_thread;
     std::thread e3_reaper_thread;
     std::thread e3_sub_thread;
+    std::thread e3_notifier_thread;
     std::atomic<bool> e3_running{false};
     std::atomic<bool> e3_reaper_running{false};
     std::atomic<bool> e3_sub_running{false};
+    std::atomic<bool> e3_notifier_running{false};
 
     // Active subscriptions
     struct E3Subscription {
@@ -292,6 +299,13 @@ private:
     // Thread functions
     void dataServerThread();
     void reaperThread();
+    void notifierThread();
+
+    /** Walk active subscriptions and send indications to any that are due
+     * (periodicity elapsed since last_update), reading the current snapshot
+     * from DataLake. Called from notifierThread() on NOTIFIER_TICK_INTERVAL.
+     */
+    void sendDueIndications();
     void reapTimedOutDapps();
     void managerSubscriptionThread();
 

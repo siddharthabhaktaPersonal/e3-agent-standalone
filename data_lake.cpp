@@ -138,12 +138,9 @@ void DataLake::pushL2Slot(uint16_t sfn, uint16_t slot, const std::vector<SlotCel
         cell.n_ue = static_cast<uint16_t>(cell.ues.size());
     }
 
-    {
-        std::lock_guard<std::mutex> lock(e3_buffer_mutex);
-        e3_buffer_info = std::move(local);
-    }
-
-    if (e3_agent) {
-        e3_agent->notifyDataReady();
-    }
+    // Just update the snapshot; E3Agent's own notifier thread reads this
+    // independently and sends indications per each subscription's
+    // configured periodicity - no need to poke it here.
+    std::lock_guard<std::mutex> lock(e3_buffer_mutex);
+    e3_buffer_info = std::move(local);
 }

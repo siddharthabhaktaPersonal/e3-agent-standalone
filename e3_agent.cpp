@@ -72,6 +72,9 @@ bool E3Agent::init()
     e3_sub_running = true;
     e3_sub_thread = std::thread(&E3Agent::managerSubscriptionThread, this);
 
+    e3_notifier_running = true;
+    e3_notifier_thread = std::thread(&E3Agent::notifierThread, this);
+
     {
         std::lock_guard<std::mutex> lock(dataLake->e3_buffer_mutex);
         dataLake->e3_buffer_info = {};
@@ -100,6 +103,14 @@ void E3Agent::shutdown()
         NVLOGC_FMT(TAG_E3, "E3 subscription thread shutdown");
     }
 
+    if (e3_notifier_running) {
+        e3_notifier_running = false;
+        if (e3_notifier_thread.joinable()) {
+            e3_notifier_thread.join();
+        }
+        NVLOGC_FMT(TAG_E3, "E3 notifier thread shutdown");
+    }
+
     if (e3_reaper_running) {
         e3_reaper_running = false;
         if (e3_reaper_thread.joinable()) {
@@ -118,9 +129,26 @@ void E3Agent::shutdown()
     }
 }
 
-// Notify subscribers that L2 KPI data is ready for this slot.
+// Notifier thread - independent of DataLake's data-refresh cadence, this
+// just wakes on NOTIFIER_TICK_INTERVAL and asks sendDueIndications() which
+// (if any) subscriptions are due, per their own configured periodicity_us.
+void E3Agent::notifierThread()
+{
+    NVLOGC_FMT(TAG_E3, "E3 notifier thread started");
+
+    while (e3_notifier_running) {
+        sendDueIndications();
+        std::this_thread::sleep_for(NOTIFIER_TICK_INTERVAL);
+    }
+
+    NVLOGC_FMT(TAG_E3, "E3 notifier thread stopped");
+}
+
+// Send indications to subscriptions whose periodicity has elapsed, using
+// whatever L2 KPI snapshot is currently in DataLake (read fresh each call -
+// DataLake refreshes it independently, on its own cadence).
 // Flow: gate → periodicity → bit-walks (root → cell → per-UE) → empty check → send → update timestamp.
-void E3Agent::notifyDataReady()
+void E3Agent::sendDueIndications()
 {
     if (!e3_running) {
         return;
