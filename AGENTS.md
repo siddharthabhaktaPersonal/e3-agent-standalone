@@ -1,34 +1,38 @@
-# E3 Agent — standalone (forked from cuPHY-CP/data_lake)
+# E3 Agent — standalone (Layer-2 KPI edition)
 
 ## Purpose
 
-This directory started as NVIDIA's `data_lake` (per-slot PHY telemetry capture
-into ClickHouse, streamed to dApps over the E3 interface) and has been
-forked into a **standalone Linux process**: `e3_agent.hpp`/`.cpp` (the E3
-ZMQ + POSIX-SHM interface) are unmodified, but the ClickHouse/cuPHY-coupled
-`data_lake` has been replaced with a plain C/C++ in-process data structure plus
-a synthetic slot-clock generator, and the CUDA/cuphydriver/nvipc/ClickHouse
-build dependencies are gone. See `README.md` for build/run instructions and
-`e3_manager.cpp` for a sample E3 Manager (dApp-side) reference client.
+A standalone Linux process implementing an E3 interface for Layer-2 (MAC)
+KPIs (PRB usage, TBS, per-LCID bytes, MCS, CQI, HARQ outcomes, BLER, SNR,
+BSR, PHR) delivered as JSON over ZMQ - no shared memory, no L1/PHY
+telemetry. See `README.md` for the full field list, build/run instructions,
+and the project's history (it started as a fork of NVIDIA's L1/SHM
+`cuPHY-CP/data_lake`; that surface has since been fully replaced - see
+README's "History" section).
 
 ## Invariants (never violate)
 
-- **`e3::StreamType` IDs and `SharedMemoryHeader` are a wire/ABI contract.**
-  They are what makes this fork interoperable with real out-of-tree E3
-  Manager/dApp implementations (e.g. `NVIDIA/aerial-sample-apps` dApps), which
-  is the whole point of keeping `e3_agent.hpp`/`.cpp` unmodified. A
-  renumber/rename/reorder that compiles and passes every local check still
-  silently breaks any real consumer. The append-only / never-reorder / cap-128
-  rules that prevent this live in the `e3_agent.hpp` comments at each type
-  definition - read and obey them there before editing these types. There is
-  no automated wire-format test here (same as upstream) - verify manually with
-  `e3_manager_sample` against `e3_agent_standalone` after any change.
+- **`e3::StreamType` IDs in `e3_agent.hpp` are a wire/ABI contract.** They
+  are the stable values used in `E3-SubscriptionRequest.telemetryIdentifierList`
+  and `E3-RanFunctionDefinition`. Append-only, never reorder or reuse a bit
+  position - a renumber that compiles and passes every local check still
+  silently breaks any real consumer. There is no automated wire-format test
+  here - verify manually with `e3_manager_sample` against
+  `e3_agent_standalone` after any change to this enum or to
+  `notifyDataReady()`'s field mapping.
+- Keep `data_lake.hpp`'s KPI structs (`PrbStats`, `TbsStats`, `PerLcidBytes`,
+  `McsIndexStats`, `WbCqi`, `TbStats`, `SnrStats`, `BsrStats`, `PhrStats`)
+  and `e3_agent.cpp`'s `notifyDataReady()` field mapping in sync - each
+  `e3::StreamType` bit corresponds to exactly one field/array here.
 
 ## What lives where
 
-- `e3_agent.hpp` / `e3_agent.cpp` - E3 interface, unmodified from upstream.
-- `nvlog.hpp` - drop-in logging shim (upstream's nvlog is internal-only) so the
-  two files above compile without edits.
-- `data_lake.hpp` / `data_lake.cpp` - standalone data store + synthetic feeder.
+- `e3_agent.hpp` / `e3_agent.cpp` - the E3 interface: ZMQ REQ/REP setup,
+  PUB/SUB subscribe/indications, `e3::StreamType` L2 KPI wire IDs. No SHM.
+- `nvlog.hpp` - drop-in logging shim (NVIDIA's nvlog is internal-only) so
+  the interface files don't need it.
+- `data_lake.hpp` / `data_lake.cpp` - `DataLake`: one slot's worth of
+  per-UE L2 KPIs in plain structs, plus a synthetic slot-clock generator.
 - `main.cpp` - standalone E3 Agent process entry point.
-- `e3_manager.cpp` - sample E3 Manager reference client.
+- `e3_manager.cpp` - sample E3 Manager reference client (decodes/prints
+  every L2 KPI field; also supports `--dump-file` JSONL wire capture).

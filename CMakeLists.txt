@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Standalone E3 Agent + sample E3 Manager.
+# Standalone E3 Agent + sample E3 Manager - Layer-2 (MAC) KPI edition.
 #
-# Unlike the production cuPHY-CP build, this project has no CUDA, cuPHY,
-# ClickHouse, nvipc, or nvlog dependency: it's a plain Linux CMake project
-# that only needs libzmq, cppzmq, nlohmann-json, and fmt (for the nvlog
-# shim). e3_agent.hpp / e3_agent.cpp are vendored in unmodified.
+# Plain Linux CMake project, no CUDA/cuPHY/ClickHouse/nvipc - only needs
+# libzmq, cppzmq, nlohmann-json, and fmt (for the nvlog shim). No shared
+# memory dependency either: every L2 KPI stream travels inline in JSON.
 
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 project(e3_agent_standalone LANGUAGES CXX)
@@ -42,7 +41,6 @@ target_link_libraries(e3_agent_standalone PRIVATE
     Threads::Threads
     nlohmann_json::nlohmann_json
     fmt::fmt
-    rt
 )
 if(cppzmq_FOUND)
     target_link_libraries(e3_agent_standalone PRIVATE cppzmq)
@@ -61,7 +59,6 @@ target_link_libraries(e3_manager_sample PRIVATE
     Threads::Threads
     nlohmann_json::nlohmann_json
     fmt::fmt
-    rt
 )
 if(cppzmq_FOUND)
     target_link_libraries(e3_manager_sample PRIVATE cppzmq)

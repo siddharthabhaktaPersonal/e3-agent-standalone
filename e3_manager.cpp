@@ -1,30 +1,25 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * Sample E3 Manager (dApp-side reference client).
+ * Sample E3 Manager (dApp-side reference client) - Layer-2 (MAC) KPI edition.
  *
  * Speaks the same E3AP session e3_agent.cpp implements:
  *   1. REQ/REP  setupRequest -> setupResponse                  (agent's rep_port)
  *   2. PUB/SUB  subscriptionRequest/-Delete/dAppControlAction   (agent's sub_port, manager PUBs)
  *   3. SUB/PUB  subscriptionResponse / indicationMessage / releaseMessage (agent's pub_port, manager SUBs)
- *   4. SHM      POSIX shared memory "/e3_ran_buffers" for the bulk sample data
- *      referenced by indications (iq_samples, pdu_data, h_estimates, srs_*).
  *
- * It reuses e3::streamNameToType / e3::E3AP_PROTOCOL_VERSION / SharedMemoryHeader
- * straight from e3_agent.hpp so the wire contract can't drift between agent and
- * manager - only DataLake's synthetic feed is standalone-specific, this file
- * is not.
+ * There is no shared-memory channel in this version - every L2 KPI stream
+ * travels inline in the indication's JSON protocolData, so this file has no
+ * SHM handling at all (unlike the earlier L1 edition of this project).
+ *
+ * It reuses e3::streamNameToType / e3::E3AP_PROTOCOL_VERSION straight from
+ * e3_agent.hpp so the wire contract can't drift between agent and manager.
  */
 
 #include "e3_agent.hpp"
 
 #include <zmq.hpp>
 #include <nlohmann/json.hpp>
-
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -60,8 +55,9 @@ struct Config {
     uint16_t pubPort = 5556;
     uint16_t subPort = 5557;
     std::vector<std::string> streams = {
-        "sfn", "slot", "cell_id", "n_ue", "rnti", "rsrp", "sinr",
-        "mcs_index", "tb_crc_fail", "iq_samples", "pdu_data"
+        "sfn", "slot", "cell_id", "n_ue", "rnti",
+        "dl_prb", "ul_prb", "dl_mcs", "ul_mcs", "wb_cqi",
+        "dl_bler", "ul_bler", "pusch_snr", "pucch_snr", "total_bsr", "phr"
     };
     uint32_t periodicityUs = 100000;
     uint32_t subscriptionTimeS = 0; // 0 = indefinite (explicit unsubscribe on exit)
@@ -132,83 +128,9 @@ struct MessageDumper {
     }
 };
 
-// ---- Shared-memory view -------------------------------------------------
-
-struct ShmRegions {
-    void* base = nullptr;
-    size_t size = 0;
-    const SharedMemoryHeader* header = nullptr;
-    uint8_t* fh[2] = {};
-    uint8_t* pusch[2] = {};
-    uint8_t* hest[2] = {};
-    uint8_t* srsIq[2] = {};
-    uint8_t* srsRbSnr[2] = {};
-    uint8_t* srsHest[2] = {};
-
-    bool open(const char* name)
-    {
-        int fd = shm_open(name, O_RDONLY, 0666);
-        if (fd == -1) {
-            fprintf(stderr, "shm_open(%s) failed: %s\n", name, strerror(errno));
-            return false;
-        }
-        struct stat st{};
-        if (fstat(fd, &st) == -1) {
-            fprintf(stderr, "fstat failed: %s\n", strerror(errno));
-            close(fd);
-            return false;
-        }
-        size = static_cast<size_t>(st.st_size);
-        base = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
-        close(fd);
-        if (base == MAP_FAILED) {
-            fprintf(stderr, "mmap failed: %s\n", strerror(errno));
-            base = nullptr;
-            return false;
-        }
-
-        header = static_cast<const SharedMemoryHeader*>(base);
-        uint8_t* p = static_cast<uint8_t*>(base) + sizeof(SharedMemoryHeader);
-        fh[0] = p;                              p += header->fh_buffer_size;
-        fh[1] = p;                              p += header->fh_buffer_size;
-        pusch[0] = p;                           p += header->pusch_buffer_size;
-        pusch[1] = p;                           p += header->pusch_buffer_size;
-        hest[0] = p;                            p += header->hest_buffer_size;
-        hest[1] = p;                            p += header->hest_buffer_size;
-        srsIq[0] = p;                           p += header->srs_iq_buffer_size;
-        srsIq[1] = p;                           p += header->srs_iq_buffer_size;
-        srsRbSnr[0] = p;                        p += header->srs_rb_snr_buffer_size;
-        srsRbSnr[1] = p;                        p += header->srs_rb_snr_buffer_size;
-        srsHest[0] = p;                         p += header->srs_hest_buffer_size;
-        srsHest[1] = p;                         p += header->srs_hest_buffer_size;
-        return true;
-    }
-
-    ~ShmRegions()
-    {
-        if (base) munmap(base, size);
-    }
-};
-
-// Print a short preview of raw int16 SHM samples (first few values only).
-void previewI16(const uint8_t* base, uint64_t byteOffset, uint32_t count, const char* label)
-{
-    const int16_t* s = reinterpret_cast<const int16_t*>(base + byteOffset);
-    printf("      %s @+%llu: [", label, static_cast<unsigned long long>(byteOffset));
-    for (uint32_t i = 0; i < std::min<uint32_t>(count, 6); ++i) printf("%d%s", s[i], (i + 1 < std::min<uint32_t>(count, 6)) ? "," : "");
-    printf("%s]\n", count > 6 ? ",..." : "");
-}
-
-void previewBytes(const uint8_t* base, uint64_t byteOffset, uint32_t count, const char* label)
-{
-    printf("      %s @+%llu (%u bytes): [", label, static_cast<unsigned long long>(byteOffset), count);
-    for (uint32_t i = 0; i < std::min<uint32_t>(count, 8); ++i) printf("%02x", base[byteOffset + i]);
-    printf("%s]\n", count > 8 ? "..." : "");
-}
-
 // ---- Indication decoding -------------------------------------------------
 
-void decodeIndication(const json& msg, const ShmRegions& shm)
+void decodeIndication(const json& msg)
 {
     const json& pd = msg.value("protocolData", json::object());
     printf("indication sub=%u sfn=%d slot=%d\n",
@@ -218,51 +140,54 @@ void decodeIndication(const json& msg, const ShmRegions& shm)
     for (const auto& cell : pd["cells"]) {
         printf("  cell_id=%d n_ue=%d\n", cell.value("cell_id", -1), cell.value("n_ue", -1));
 
-        if (shm.header && cell.contains("iq_samples")) {
-            const auto& s = cell["iq_samples"];
-            int idx = s.value("fh_buffer_index", 0);
-            uint32_t row = s.value("fh_write_index", 0u);
-            uint64_t off = static_cast<uint64_t>(row) * shm.header->num_fh_samples * sizeof(int16_t);
-            previewI16(shm.fh[idx & 1], off, shm.header->num_fh_samples, "iq_samples");
-        }
-        if (shm.header && cell.contains("pdu_data")) {
-            const auto& s = cell["pdu_data"];
-            int idx = s.value("pusch_buffer_index", 0);
-            uint32_t row = s.value("pusch_write_index", 0u);
-            uint32_t rowStride = shm.header->num_pusch_rows ? shm.header->pusch_buffer_size / shm.header->num_pusch_rows : 0;
-            uint64_t off = static_cast<uint64_t>(row) * rowStride;
-            previewBytes(shm.pusch[idx & 1], off, std::min<uint32_t>(rowStride, 64), "pdu_data (row)");
-        }
-        if (shm.header && cell.contains("h_estimates")) {
-            const auto& s = cell["h_estimates"];
-            int idx = s.value("hest_buffer_index", 0);
-            uint64_t off = s.value("hest_row_byte_offset", 0u);
-            previewBytes(shm.hest[idx & 1], off, 32, "h_estimates");
-        }
-        if (shm.header && cell.contains("srs_iq_samples")) {
-            const auto& s = cell["srs_iq_samples"];
-            int idx = s.value("srs_iq_buffer_index", 0);
-            uint64_t off = s.value("srs_iq_row_byte_offset", 0u);
-            previewI16(shm.srsIq[idx & 1], off, 8, "srs_iq_samples");
-        }
-
         if (!cell.contains("ues")) continue;
         for (const auto& ue : cell["ues"]) {
             printf("    rnti=%d", ue.value("rnti", -1));
-            if (ue.contains("rsrp")) printf(" rsrp=%.1f", ue.value("rsrp", 0.0f));
-            if (ue.contains("sinr")) printf(" sinr=%.1f", ue.value("sinr", 0.0f));
-            if (ue.contains("mcs_index")) printf(" mcs=%d", ue.value("mcs_index", 0));
-            if (ue.contains("tb_crc_fail")) printf(" crc_fail=%d", ue.value("tb_crc_fail", 0));
-            if (ue.contains("srs_wideband_snr")) printf(" srs_snr=%.1f", ue.value("srs_wideband_snr", 0.0f));
+            if (ue.contains("dl_prb") || ue.contains("ul_prb"))
+                printf(" prb(dl/ul)=%d/%d", ue.value("dl_prb", 0), ue.value("ul_prb", 0));
+            if (ue.contains("dl_prb_retx") || ue.contains("ul_prb_retx"))
+                printf(" prb_retx(dl/ul)=%d/%d", ue.value("dl_prb_retx", 0), ue.value("ul_prb_retx", 0));
+            if (ue.contains("dl_curr_tbs") || ue.contains("ul_curr_tbs"))
+                printf(" curr_tbs(dl/ul)=%llu/%llu",
+                       static_cast<unsigned long long>(ue.value("dl_curr_tbs", 0ull)),
+                       static_cast<unsigned long long>(ue.value("ul_curr_tbs", 0ull)));
+            if (ue.contains("dl_aggr_tbs") || ue.contains("ul_aggr_tbs"))
+                printf(" aggr_tbs(dl/ul)=%llu/%llu",
+                       static_cast<unsigned long long>(ue.value("dl_aggr_tbs", 0ull)),
+                       static_cast<unsigned long long>(ue.value("ul_aggr_tbs", 0ull)));
+            if (ue.contains("dl_mcs") || ue.contains("ul_mcs"))
+                printf(" mcs(dl/ul)=%d/%d", ue.value("dl_mcs", 0), ue.value("ul_mcs", 0));
+            if (ue.contains("wb_cqi")) printf(" cqi=%d", ue.value("wb_cqi", 0));
+            if (ue.contains("dl_errors") || ue.contains("ul_errors"))
+                printf(" errors(dl/ul)=%d/%d", ue.value("dl_errors", 0), ue.value("ul_errors", 0));
+            if (ue.contains("dl_bler") || ue.contains("ul_bler"))
+                printf(" bler(dl/ul)=%.3f/%.3f", ue.value("dl_bler", 0.0), ue.value("ul_bler", 0.0));
+            if (ue.contains("pusch_snr") || ue.contains("pucch_snr"))
+                printf(" snr(pusch/pucch)=%d/%d", ue.value("pusch_snr", 0), ue.value("pucch_snr", 0));
+            if (ue.contains("total_bsr")) printf(" bsr=%llu", static_cast<unsigned long long>(ue.value("total_bsr", 0ull)));
+            if (ue.contains("phr")) printf(" phr=%d", ue.value("phr", 0));
             printf("\n");
 
-            if (shm.header && ue.contains("srs_hest_offset") && ue.contains("srs_hest_size") && cell.contains("srs_hest")) {
-                int idx = cell["srs_hest"].value("srs_hest_buffer_index", 0);
-                previewBytes(shm.srsHest[idx & 1], ue.value("srs_hest_offset", 0u), std::min<uint32_t>(ue.value("srs_hest_size", 0u), 16u), "srs_hest");
+            if (ue.contains("dl_harq_rounds")) {
+                printf("      dl_harq_rounds=[");
+                const auto& rounds = ue["dl_harq_rounds"];
+                for (size_t i = 0; i < rounds.size(); ++i) printf("%s%d", i ? "," : "", rounds[i].get<int>());
+                printf("]\n");
             }
-            if (shm.header && ue.contains("srs_rb_snr_offset") && ue.contains("srs_rb_snr_size") && cell.contains("srs_rb_snr")) {
-                int idx = cell["srs_rb_snr"].value("srs_rb_snr_buffer_index", 0);
-                previewBytes(shm.srsRbSnr[idx & 1], ue.value("srs_rb_snr_offset", 0u), std::min<uint32_t>(ue.value("srs_rb_snr_size", 0u), 16u), "srs_rb_snr");
+            if (ue.contains("per_lcid_dl_bytes") || ue.contains("per_lcid_ul_bytes")) {
+                auto printNonzero = [](const char* label, const json& arr) {
+                    printf("      %s=[", label);
+                    bool first = true;
+                    for (size_t i = 0; i < arr.size(); ++i) {
+                        uint64_t v = arr[i].get<uint64_t>();
+                        if (v == 0) continue;
+                        printf("%slcid%zu:%llu", first ? "" : ",", i, static_cast<unsigned long long>(v));
+                        first = false;
+                    }
+                    printf("]\n");
+                };
+                if (ue.contains("per_lcid_dl_bytes")) printNonzero("per_lcid_dl_bytes", ue["per_lcid_dl_bytes"]);
+                if (ue.contains("per_lcid_ul_bytes")) printNonzero("per_lcid_ul_bytes", ue["per_lcid_ul_bytes"]);
             }
         }
     }
@@ -337,13 +262,7 @@ int main(int argc, char** argv)
     printf("Setup OK: dAppIdentifier=%u ranIdentifier=%s ranFunctionId=%u\n",
            dappId, setupResp.value("ranIdentifier", std::string()).c_str(), ranFunctionId);
 
-    // --- 2. Open the SHM data channel the agent created ---
-    ShmRegions shm;
-    if (!shm.open("/e3_ran_buffers")) {
-        fprintf(stderr, "Warning: could not open SHM data channel; SHM-backed streams won't be previewed.\n");
-    }
-
-    // --- 3. Subscribe (manager PUB -> agent SUB), response arrives on manager SUB ---
+    // --- 2. Subscribe (manager PUB -> agent SUB), response arrives on manager SUB ---
     std::vector<uint32_t> telemetryIds;
     for (const auto& name : cfg.streams) {
         e3::StreamType st = e3::streamNameToType(name);
@@ -351,7 +270,7 @@ int main(int argc, char** argv)
             fprintf(stderr, "Unknown stream name '%s', skipping\n", name.c_str());
             continue;
         }
-        __uint128_t val = static_cast<__uint128_t>(st);
+        uint64_t val = static_cast<uint64_t>(st);
         uint32_t pos = 0;
         while (val >>= 1) ++pos;
         telemetryIds.push_back(pos + 1);
@@ -382,7 +301,7 @@ int main(int argc, char** argv)
     bool subscribed = false;
     const auto subDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 
-    // --- 4. Main receive loop: subscriptionResponse first, then indications ---
+    // --- 3. Main receive loop: subscriptionResponse first, then indications ---
     const auto runDeadline = (cfg.durationS > 0)
         ? std::chrono::steady_clock::now() + std::chrono::seconds(cfg.durationS)
         : std::chrono::steady_clock::time_point::max();
@@ -417,14 +336,14 @@ int main(int argc, char** argv)
                 fprintf(stderr, "Subscription rejected: %s\n", m.value("message", "unknown").c_str());
             }
         } else if (type == "indicationMessage" && m.value("dAppIdentifier", 0u) == dappId) {
-            decodeIndication(m, shm);
+            decodeIndication(m);
         } else if (type == "releaseMessage" && m.value("dAppIdentifier", 0u) == dappId) {
             printf("Agent released this dApp (idle timeout). Exiting.\n");
             break;
         }
     }
 
-    // --- 5. Clean shutdown: delete subscription, release ---
+    // --- 4. Clean shutdown: delete subscription, release ---
     if (subscribed && subscriptionId != 0) {
         json delReq;
         delReq["type"] = "subscriptionDelete";
